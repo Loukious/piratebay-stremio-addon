@@ -1,38 +1,63 @@
 const Stremio = require('stremio-addons');
-const imdb = require('imdb');
+const {
+	IMDb,
+	Movie
+} = require('imdb');
 const torrentStream = require('torrent-stream');
 const parseVideo = require('video-name-parser');
 const _ = require('lodash');
-const PirateBay = require('thepiratebay');
-const {isEmpty, not, pipe, pathOr, equals, flatten, cond, prop, filter, sort, ifElse} = require('ramda');
+const PirateBay = require('thepiratebayfixed');
+const {
+	isEmpty,
+	not,
+	pipe,
+	pathOr,
+	equals,
+	flatten,
+	cond,
+	prop,
+	filter,
+	sort,
+	ifElse
+} = require('ramda');
 const nameToImdb = require('name-to-imdb');
 const ONE_DAY = 86400;
 let cache;
 
+const initMongo = async (db) => {
+	await db.collection('cache').createIndex({
+		createdAt: 1
+	}, {
+		expireAfterSeconds: ONE_DAY
+	});
 
-const initMongo = async db => {
-	await db.get('cache').ensureIndex({
-		createdAt: 1,
+	await db.collection('cache').createIndex({
 		id: 1
-	}, {expireAfterSeconds: ONE_DAY});
-	cache = await db.get('cache')
+	});
+
+	cache = db.collection('cache');
 };
 
-const titleToImdb = name => new Promise(( resolve, rejected ) =>
-	nameToImdb({name}, ( err, res ) => {
+const titleToImdb = name => new Promise((resolve, rejected) =>
+	nameToImdb({
+		name
+	}, (err, res) => {
 		if (err) {
 			rejected(new Error(err.message));
 		}
 		resolve(res);
 	}));
 
-
-const cinemeta = imdb_id => {
+const cinemeta = id => {
 	const client = new Stremio.Client();
 	client.add('http://cinemeta.strem.io/stremioget/stremio/v1');
 
-	return new Promise(( resolve, rejected ) => {
-		client.meta.get({query: {imdb_id}}, function ( err, meta ) {
+	return new Promise((resolve, rejected) => {
+		client.meta.get({
+			query: {
+				id
+			}
+		}, function (err, meta) {
 			if (err) {
 				rejected(new Error(err.message));
 			}
@@ -43,35 +68,38 @@ const cinemeta = imdb_id => {
 
 const padNumber = pipe(
 	n => n.toString() || '',
-	s => s.padStart(2, '0')
-);
+	s => s.padStart(2, '0'));
 
-const imdbIdToName = ( {imdb_id, season = 0, episode = 0} ) => {
-	return new Promise(function ( resolve, reject ) {
-		imdb(imdb_id, function ( err, data ) {
-			if (err) {
-				reject(new Error(err.message));
-			}
-			resolve({
-				name: `${data.title} S${padNumber(season)}E${padNumber(episode)}`,
-				nameComplete: `${data.title} S${padNumber(season)} complete`
-			});
-		});
-	});
+const imdbIdToName = async ({
+	id,
+	season = 0,
+	episode = 0
+}) => {
+	try {
+		const i = new IMDb();
+		const movie = await i.getMovie(id);
+		return {
+			name: `${movie.getTitle()} S${padNumber(season)}E${padNumber(episode)}`,
+			nameComplete: `${movie.getTitle()} S${padNumber(season)} complete`
+		};
+	} catch (error) {
+		throw new Error(error.message);
+	}
 };
 
 const checkType = type => pipe(
 	prop('type'),
-	equals(type)
-);
+	equals(type));
 
 const getTitle = cond([
-	[ checkType('movie'), query => ({name: query.imdb_id}) ],
-	[ checkType('series'), imdbIdToName ],
+	[checkType('movie'), query => ({
+		name: query.id
+	})],
+	[checkType('series'), imdbIdToName],
 ]);
 
 const torrentStreamEngine = magnetLink => {
-	return new Promise(function ( resolve, reject ) {
+	return new Promise(function (resolve, reject) {
 		const engine = new torrentStream(magnetLink, {
 			connections: 30
 		});
@@ -96,8 +124,8 @@ const getMetaDataByName = async name => {
 
 	try {
 		const video = await parseVideo(name);
-		const imdb_id = await titleToImdb(video.name);
-		const metaData = await cinemeta(imdb_id);
+		const id = await titleToImdb(video.name);
+		const metaData = await cinemeta(id);
 
 		meta.banner = _.get(metaData, 'background') || _.get(metaData, 'fanart.showbackground[0].url');
 		meta.poster = _.get(metaData, 'background') || _.get(metaData, 'fanart.showbackground[0].url');
@@ -115,45 +143,54 @@ const getMetaDataByName = async name => {
 };
 
 const isFull = pipe(
-	pathOr([], [ 'results' ]),
+	pathOr([], ['results']),
 	isEmpty,
-	not
-);
+	not);
 
-const ptbSearch = async ( query, isCompleteSeason = false ) => {
-	const cachedResults = await cache.findOne({id: query}, {
+const ptbSearch = async (query, isCompleteSeason = false) => {
+	const cachedResults = await cache.findOne({
+		id: query
+	}, {
 		'fields': {
 			'_id': 0,
 			'results': 1
 		}
 	});
-
-	if (isFull(cachedResults)) return pathOr([], [ 'results' ], cachedResults);
+	
+	if (isFull(cachedResults))
+		return pathOr([], ['results'], cachedResults);
 	const ptbResults = await PirateBay.search(query, {
 		orderBy: 'seeds',
 		sortBy: 'desc',
 		category: 'video'
 	});
-
 	//@TODO
 	if (isCompleteSeason) {
 		await ptbResults.results.map(async (file) => {
-			const {torrent} = await torrentStreamEngine(file.magnetLink);
+			const {
+				torrent
+			} = await torrentStreamEngine(file.magnetLink);
 			// console.log(torrent.files);
 		})
 	}
-
-	const results = await cache.findOneAndUpdate(
-		{id: query},
+	const updatedResults = await cache.findOneAndUpdate(
+		{ id: query },
 		{
+		  $set: {
+			results: ptbResults.slice(0, 4)
+		  },
+		  $setOnInsert: {
 			id: query,
-			createdAt: new Date(),
-			results: pathOr([], [ 'results' ], ptbResults).slice(0, 4)
+			createdAt: new Date()
+		  }
 		},
-		{returnNewDocument: true, upsert: true}
-	);
-
-	return pathOr([], [ 'results' ], results);
+		{
+		  returnDocument: "after",
+		  upsert: true
+		}
+	  );
+	const results = updatedResults['value'];
+	return pathOr([], ['results'], results);
 };
 
 const serializeResults = ifElse(
@@ -162,19 +199,20 @@ const serializeResults = ifElse(
 	pipe(
 		flatten,
 		filter(file => file.seeders > 0),
-		sort(( a, b ) => b.seeders > a.seeders)
-	)
-)
+		sort((a, b) => b.seeders > a.seeders)))
+
 
 const search = cond([
-	[ checkType('series'), async ( title ) => {
-		const res = await Promise.all([ ptbSearch(title.name)]); // @TODO: , ptbSearch(title.nameComplete, true)
+	[checkType('series'), async (title) => {
+		const res = await Promise.all([ptbSearch(title.name)]); // @TODO: , ptbSearch(title.nameComplete, true)
 		return serializeResults(res);
-	} ],
-	[ checkType('movie'), async ( title ) => {
+	}
+	],
+	[checkType('movie'), async (title) => {
 		const res = await ptbSearch(title.name);
 		return serializeResults(res);
-	} ]
+	}
+	]
 ]);
 
 module.exports = {

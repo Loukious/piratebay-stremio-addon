@@ -1,38 +1,67 @@
 const Stremio = require('stremio-addons');
 const magnet = require('magnet-uri');
-const db = require('monk')(process.env.MONGO_URI);
+const MongoClient = require('mongodb').MongoClient;
+const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
+const MONGO_URI = process.env.MONGO_URI || '';
+
+
+const client = new MongoClient(MONGO_URI);
+// Connect to MongoDB
+client.connect();
+
+// Access DB
+const db = client.db(); // replace 'databaseName' with your database name
 
 const manifest = require('./manifest');
 const {
-	initMongo,
-	getTitle,
-	search
+    initMongo,
+    getTitle,
+    search
 } = require('./tools');
 
-const addon = new Stremio.Server({
-	'stream.find': async ( {query}, callback ) => {
-		try {
-			const title = await getTitle(query);
-			const results = await search({...title, type: query.type}) || [];
-			const resolve = results.map(file => {
-				const {infoHash} = magnet.decode(file.magnetLink);
-				const detail = `${file.name}\n💾 ${file.size}\n👤 ${file.seeders}`;
-				return {infoHash, name: 'PTB', title: detail, availability: 1};
-			});
-			return callback(null, resolve);
-		} catch (e) {
-			console.log(e)
-		}
-	},
-}, manifest);
+const builder = new addonBuilder(manifest);
 
 
-const server = require('http').createServer(( req, res ) => {
-	addon.middleware(req, res, async function () {
-		return res.end()
-	});
-}).on('listening', async () => {
-		await initMongo(db);
-		console.log(`Piratebay Stremio Addon listening on ${server.address().port}`);
-	})
-	.listen(process.env.PORT || 7000);
+builder.defineStreamHandler(async function (args) {
+    try {
+        if (args.type === 'movie' || args.type === 'series') {
+            const idParts = args.id.split(':');
+            if (idParts.length > 1) {
+                const season = parseInt(idParts[1], 10);
+                const episode = parseInt(idParts[2], 10);
+                args["season"] = season;
+                args["episode"] = episode;
+                args["id"] = idParts[0]
+            }
+            const title = await getTitle(args);
+            const results = await search({ ...title, type: args.type }) || [];
+            const streams = results.map(file => {
+                const { infoHash } = magnet.decode(file.magnetLink);
+                const detail = `${file.name}\n💾 ${file.size} 👤 ${file.seeders}`;
+                return {
+                    infoHash,
+                    name: 'TPB',
+                    title: detail,
+                    availability: 1
+                };
+            });
+            return Promise.resolve({ streams: streams });
+        } else {
+            return Promise.resolve({ streams: [] });
+        }
+    } catch (e) {
+        console.log(e);
+        return Promise.reject(e);
+    }
+});
+
+async function startServer() {
+    try {
+        await initMongo(db); // Await the initialization of the MongoDB connection
+        serveHTTP(builder.getInterface(), { port: 7000 }); // Start the server
+    } catch (error) {
+        console.error('Error initializing MongoDB:', error);
+    }
+}
+
+startServer();
